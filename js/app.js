@@ -16,14 +16,16 @@ var ICON = {
   shield: '<path d="M12 3l7 3v5c0 5-3 8.500-7 10-4-1.500-7-5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/>',
   warn: '<path d="M12 4L2.500 20h19z"/><path d="M12 10v5M12 17.500v.5"/>',
+  greedy: '<path d="M4 6h16M4 12h11M4 18h6"/><path d="M17 10l3 2-3 2"/>',
+  simulate: '<path d="M4 19V5M4 19h17"/><path d="M7 15l4-5 3 2 5-7"/><circle cx="19" cy="5" r="1.5"/>',
   chev: '<path d="M6 9l6 6 6-6"/>', arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>'
 };
 var svg = function (n) { return '<svg viewBox="0 0 24 24" aria-hidden="true">' + ICON[n] + "</svg>"; };
 var PAGES = [["dashboard", "Dashboard", "grid"], ["events", "Events & Staffing", "cal"], ["roster", "Volunteers Roster", "users"],
-  ["committee", "Manage Core Committee", "userset"], ["skills", "Skills Catalog", "award"], ["audit", "Audit History", "shield"]];
+  ["greedy", "Allocation", "greedy"], ["simulator", "What-if Simulator", "simulate"], ["committee", "Manage Core Committee", "userset"], ["skills", "Skills Catalog", "award"], ["audit", "Audit History", "shield"]];
 
 /* ------------------------------------------------------------------ state */
-var S, ui = { dashEvent: null, evSel: null, open: {}, q: "", skillF: "" };
+var S, ui = { dashEvent: null, evSel: null, open: {}, q: "", skillF: "", greedyEvent: null, simEvent: null, simAttendees: null, simMethod: null, simDepts: {} };
 function clone(o) { return JSON.parse(JSON.stringify(o)); }
 function makeEvent(e, depts) {
   var d = clone(depts);
@@ -33,7 +35,7 @@ function makeEvent(e, depts) {
 function freshState() {
   var sd = window.SEED;
   return { volunteers: clone(sd.volunteers), skills: clone(sd.skills), departments: clone(sd.departments), committee: clone(sd.committee), heads: {},
-    events: sd.events.map(function (e) { return makeEvent(e, sd.departments); }), audit: [{ t: Date.now(), a: "System ready", d: "Demo configuration loaded. Import a CSV to add volunteers." }] };
+    events: sd.events.map(function (e) { return makeEvent(e, sd.departments); }), versions: [], audit: [{ t: Date.now(), a: "System ready", d: "Demo configuration loaded. Import a CSV to add volunteers." }] };
 }
 function uniqueHeads(heads) {
   var out = {}, people = {};
@@ -51,6 +53,7 @@ function load() {
     if (old.departments && old.departments.some(function (d) { return d.id === "event-planning"; })) {
       var priorHeads = JSON.stringify(old.heads || {});
       old.heads = uniqueHeads(old.heads);
+      if (!old.versions) old.versions = [];
       if (JSON.stringify(old.heads) !== priorHeads) localStorage.setItem(KEY, JSON.stringify(old));
       return old;
     }
@@ -58,6 +61,7 @@ function load() {
     latest.volunteers.forEach(function (v) { if (!v.role) v.role = "Volunteer"; });
     latest.committee = old.committee || [];
     latest.heads = uniqueHeads(old.heads);
+    latest.versions = old.versions || [];
     latest.audit = old.audit || latest.audit;
     var skills = latest.skills.slice();
     (old.skills || []).forEach(function (s) { if (!skills.some(function (x) { return x.name === s.name; })) skills.push(s); });
@@ -136,12 +140,46 @@ function evaluate(plan, ds, ev) {
   });
   r.cov = r.req ? Math.round(100 * r.alloc / r.req) : 0; return r;
 }
-function compute(ev) {
-  var vols = S.volunteers, ds = ev.depts.filter(function (d) { return reqOf(d, ev) > 0; });
+function compute(ev, volunteerRows) {
+  var vols = volunteerRows || S.volunteers, ds = ev.depts.filter(function (d) { return reqOf(d, ev) > 0; });
   var elig = {}; ds.forEach(function (d) { elig[d.id] = vols.filter(function (v) { return !failed(v, d).length; }).map(function (v) { return v.id; }); });
   var t0 = performance.now(), h = heuristic(vols, ds, elig, ev), t1 = performance.now(), o = optimal(vols, ds, elig, ev), t2 = performance.now();
   var plan = ev.method === "heuristic" ? h : o;
   return { ds: ds, elig: elig, heur: h, opt: o, plan: plan, mh: evaluate(h, ds, ev), mo: evaluate(o, ds, ev), m: evaluate(plan, ds, ev), th: t1 - t0, to: t2 - t1 };
+}
+function pct1(v) { return (+v || 0).toFixed(1) + "%"; }
+function planStats(plan, ev, c, volunteers, elapsed) {
+  var met = evaluate(plan, c.ds, ev), used = {}, nPref = 0, nAssigned = 0, weightedReq = 0, weightedGot = 0, coverage = [], skillBad = 0, capBad = 0;
+  c.ds.forEach(function (d) {
+    var ids = plan[d.id] || [], req = reqOf(d, ev), cov = req ? ids.length / req : 1;
+    coverage.push(cov); weightedReq += PW[d.priority] * req; weightedGot += PW[d.priority] * Math.min(ids.length, req);
+    if (ids.length > d.maxCap) capBad += ids.length - d.maxCap;
+    ids.forEach(function (id) {
+      used[id] = 1; nAssigned++;
+      var v = volunteers.filter(function (x) { return x.id === id; })[0];
+      if (v && d.skill && v.skills.indexOf(d.skill) < 0) skillBad++;
+      if (v && d.prefs.some(function (p) { return String(v.pref || "").split(/\s*,\s*/).indexOf(p) >= 0; })) nPref++;
+    });
+  });
+  var mean = coverage.length ? coverage.reduce(function (a,b) { return a+b; },0) / coverage.length : 0;
+  var variance = coverage.length ? coverage.reduce(function (a,b) { return a + Math.pow(b-mean,2); },0) / coverage.length : 0;
+  var eligibleUnused = volunteers.filter(function (v) { return !used[v.id] && c.ds.some(function (d) { return !failed(v,d).length; }); }).length;
+  return { required: met.req, allocated: met.alloc, vacant: Math.max(0,met.req-met.alloc), coverage: met.cov,
+    priorityCoverage: weightedReq ? 100*weightedGot/weightedReq : 0, prefFit: nAssigned ? 100*nPref/nAssigned : 0,
+    minDeptCoverage: coverage.length ? 100*Math.min.apply(null,coverage) : 0, fairness: Math.sqrt(variance),
+    skillViolations: skillBad, capacityViolations: capBad, eligibleUnassigned: eligibleUnused,
+    weightedShortage: met.w, criticalShortage: met.crit, fullyStaffed: met.full, runtime: elapsed || 0 };
+}
+function versionNumber() { return (S.versions || []).reduce(function (n, v) { return Math.max(n, parseInt(String(v.id).replace(/\D/g,""),10) || 0); },0) + 1; }
+function saveDraftVersion(ev, volunteerRows, source, scenario) {
+  var c = compute(ev, volunteerRows), now = Date.now(), n = versionNumber(), people = {};
+  volunteerRows.forEach(function (v) { people[v.id] = { id:v.id, name:v.name, simulated: String(v.id).indexOf("SIM-") === 0 }; });
+  S.versions = S.versions || [];
+  var v = { id:"v"+n, eventId:ev.id, eventName:ev.name, createdAt:now, status:"draft", source:source,
+    scenario:scenario || null, eventSnapshot:clone(ev), people:people, greedyPlan:clone(c.heur), optimalPlan:clone(c.opt),
+    greedyMetrics:planStats(c.heur,ev,c,volunteerRows,c.th), optimalMetrics:planStats(c.opt,ev,c,volunteerRows,c.to) };
+  S.versions.unshift(v); ui.openVersionId = v.id; log("Draft created", v.id + " for " + ev.name + " (" + source + ")"); save();
+  return v;
 }
 function bottleneck(c, ev) {
   return c.m.rows.map(function (r) {
@@ -371,16 +409,127 @@ function renderAudit() {
   return h + "</tbody></table></div></div>";
 }
 
+function renderGreedy() {
+  var ev = evById(ui.greedyEvent) || S.events[0];
+  if (!ev) return head("Greedy Allocation", "Priority-first volunteer assignment") + '<div class="card">' + empty("Add an event in Events & Staffing to preview a greedy plan.") + "</div>";
+  ui.greedyEvent = ev.id;
+  var c = compute(ev), m = evaluate(c.heur, c.ds, ev), h = head("Greedy Allocation", "A fast, explainable plan that fills higher-priority departments first.");
+  h += '<div class="card"><header><div><h2>Preview a greedy plan</h2><p>Choose an event to see the greedy assignments beside the optimised result.</p></div><label class="evsel">Event <select id="greedyEvent">' +
+    S.events.map(function (x) { return '<option value="' + esc(x.id) + '"' + (x.id === ev.id ? " selected" : "") + ">" + esc(x.name) + "</option>"; }).join("") + '</select></label></header>' +
+    '<section class="kpis">' + kpi("Greedy allocated", m.alloc, m.cov + "% coverage", "check", "g") + kpi("Vacant positions", m.req - m.alloc, "Greedy plan", "warn", "a") + kpi("Weighted shortage", m.w, "Greedy plan", "grid", "") + kpi("Optimised shortage", c.mo.w, "For comparison", "simulate", "") + '</section>' +
+    '<p class="note">The greedy method sorts departments by priority, then eligible volunteers by preference and experience. Earlier assignments can use a volunteer another department also needs.</p>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>Priority</th><th>Department</th><th>Required</th><th>Greedy assigned</th><th>Vacant</th><th>Assigned volunteers</th></tr></thead><tbody>';
+  m.rows.forEach(function (r) {
+    var names = c.heur[r.d.id].map(function (id) { var v = byName(id); return v ? esc(v.name) + ' <small>' + esc(id) + '</small>' : esc(id); });
+    h += '<tr><td>' + esc(r.d.priority) + '</td><td><b>' + esc(r.d.name) + '</b></td><td>' + r.req + '</td><td class="ok"><b>' + r.got + '</b></td><td class="' + (r.vac ? "bad" : "ok") + '">' + r.vac + '</td><td>' + (names.length ? names.join(", ") : '<span class="mut">None assigned</span>') + '</td></tr>';
+  });
+  h += '</tbody></table></div><div class="row" style="margin-top:16px"><button class="btn solid" data-apply-greedy="' + esc(ev.id) + '"' + (ev.method === "heuristic" ? " disabled" : "") + '>Use greedy plan for this event</button><span class="note">' + (ev.method === "heuristic" ? "This event already uses the greedy plan." : "Applying updates the event’s selected allocation method.") + '</span></div></div>';
+  return h;
+}
+
+function renderSimulator() {
+  var ev = evById(ui.simEvent) || S.events[0];
+  if (!ev) return head("What-if Simulator", "Try staffing changes without editing the saved event") + '<div class="card">' + empty("Add an event in Events & Staffing to run a scenario.") + "</div>";
+  if (ui.simEvent !== ev.id) { ui.simEvent = ev.id; ui.simAttendees = ev.attendees; ui.simMethod = ev.method || "optimal"; ui.simDepts = {}; }
+  var base = compute(ev), trial = clone(ev);
+  trial.attendees = Math.max(0, +ui.simAttendees || 0); trial.method = ui.simMethod || "optimal";
+  trial.depts = trial.depts.map(function (d) {
+    var o = ui.simDepts[d.id] || {};
+    if (o.required !== undefined) { d.required = Math.max(0, +o.required || 0); d.type = "fixed"; }
+    if (o.maxCap !== undefined) d.maxCap = Math.max(0, +o.maxCap || 0);
+    if (o.priority) d.priority = o.priority;
+    return d;
+  });
+  var sim = compute(trial), bm = base.m, sm = sim.m;
+  var h = head("What-if Simulator", "Adjust a copy of an event and compare the results. Scenarios do not change saved event settings.");
+  h += '<div class="card"><header><div><h2>Scenario inputs</h2><p>Changes below are temporary and stay on this screen.</p></div></header><div class="formgrid">' +
+    '<label class="f">Event<select id="simEvent">' + S.events.map(function (x) { return '<option value="' + esc(x.id) + '"' + (x.id === ev.id ? " selected" : "") + ">" + esc(x.name) + "</option>"; }).join("") + '</select></label>' +
+    '<label class="f">Expected attendees<input type="number" min="0" id="simAttendees" value="' + esc(trial.attendees) + '"></label>' +
+    '<label class="f">Scenario allocation method<select id="simMethod"><option value="optimal"' + (trial.method === "optimal" ? " selected" : "") + '>Optimised</option><option value="heuristic"' + (trial.method === "heuristic" ? " selected" : "") + '>Greedy</option></select></label></div>' +
+    '<h3 style="margin-top:20px">Department assumptions</h3><p class="note">Override required staff, capacity, or priority for this scenario. Attendee changes affect throughput departments unless you override their required staff.</p>' +
+    '<div class="tbl-wrap cfg"><table><thead><tr><th>Department</th><th>Priority</th><th>Required staff</th><th>Max capacity</th></tr></thead><tbody>';
+  ev.depts.forEach(function (d) {
+    var o = ui.simDepts[d.id] || {}, required = o.required !== undefined ? o.required : reqOf(d, trial), cap = o.maxCap !== undefined ? o.maxCap : d.maxCap, priority = o.priority || d.priority;
+    h += '<tr><td>' + esc(d.name) + '</td><td><select data-sim-dept="' + esc(d.id) + '" data-sim-field="priority">' + ["Critical", "High", "Normal"].map(function (p) { return '<option' + (p === priority ? " selected" : "") + '>' + p + '</option>'; }).join("") + '</select></td>' +
+      '<td><input type="number" min="0" data-sim-dept="' + esc(d.id) + '" data-sim-field="required" value="' + esc(required) + '"></td>' +
+      '<td><input type="number" min="0" data-sim-dept="' + esc(d.id) + '" data-sim-field="maxCap" value="' + esc(cap) + '"></td></tr>';
+  });
+  h += '</tbody></table></div></div><section class="kpis" style="margin-top:20px">' +
+    kpi("Current coverage", bm.cov + "%", bm.alloc + " / " + bm.req + " positions", "grid", "") + kpi("Scenario coverage", sm.cov + "%", sm.alloc + " / " + sm.req + " positions", "check", "g") +
+    kpi("Current weighted shortage", bm.w, "Selected event plan", "warn", "a") + kpi("Scenario weighted shortage", sm.w, trial.method === "heuristic" ? "Greedy plan" : "Optimised plan", "warn", "a") + '</section>' +
+    '<div class="card"><header><h2>Current plan vs scenario</h2></header><div class="tbl-wrap"><table><thead><tr><th>Department</th><th>Current required</th><th>Scenario required</th><th>Current allocated</th><th>Scenario allocated</th><th>Scenario vacancies</th></tr></thead><tbody>';
+  sm.rows.forEach(function (r) {
+    var old = bm.rows.filter(function (x) { return x.d.id === r.d.id; })[0];
+    h += '<tr><td><b>' + esc(r.d.name) + '</b></td><td>' + (old ? old.req : 0) + '</td><td>' + r.req + '</td><td>' + (old ? old.got : 0) + '</td><td class="ok"><b>' + r.got + '</b></td><td class="' + (r.vac ? "bad" : "ok") + '">' + r.vac + '</td></tr>';
+  });
+  return h + '</tbody></table></div></div>';
+}
+
 /* ---------------------------------------------------------------- routing */
+function metricCard(title, m, selected) {
+  return '<div class="card compare-card' + (selected ? ' selected' : '') + '"><header><b>' + esc(title) + '</b><span class="pill">' + (selected ? 'Selected draft' : 'Compared') + '</span></header>' +
+    '<p>Filled ' + m.allocated + '/' + m.required + ' | Priority cov. ' + pct1(m.priorityCoverage) + ' | Pref fit ' + pct1(m.prefFit) + '</p>' +
+    '<p>Min dept cov. ' + pct1(m.minDeptCoverage) + ' | Fairness std ' + m.fairness.toFixed(3) + '</p>' +
+    '<p>Skill violations ' + m.skillViolations + ' | Capacity violations ' + m.capacityViolations + ' | ' + m.runtime.toFixed(1) + ' ms</p></div>';
+}
+function versionAssignments(v, plan, deptId) {
+  return (plan[deptId] || []).map(function (id) { var p = v.people && v.people[id]; return p ? esc(p.name) + ' <small>' + esc(id) + (p.simulated ? ' · simulated' : '') + '</small>' : esc(id); }).join(', ') || '<span class="mut">None</span>';
+}
+function versionDetail(v) {
+  var ev = v.eventSnapshot || evById(v.eventId), greedy = v.source === 'greedy', primary = greedy ? v.greedyMetrics : v.optimalMetrics,
+      plan = greedy ? v.greedyPlan : v.optimalPlan, ds = ev.depts.filter(function(d){return reqOf(d,ev)>0;}), h='';
+  h += '<div class="top" style="margin-top:24px"><div><h2>Version ' + esc(v.id) + ' <span class="pill ' + (v.status==='approved'?'ok':'warn') + '">' + (v.status==='approved'?'Approved':'Draft / not published') + '</span></h2><p class="sub">' + esc(ev.name) + (v.scenario?' · What-if scenario':'') + '</p></div></div>';
+  if(v.scenario) h += '<div class="card"><b>Scenario:</b> ' + v.scenario.dropout + '% volunteer dropout ('+v.scenario.dropoutCount+' removed) · headcount × ' + v.scenario.headcount + ' · +' + v.scenario.extraHours + ' duty hours · ' + v.scenario.addedVolunteers + ' simulated volunteer(s) with ' + esc(v.scenario.skill||'no selected skill') + '</div>';
+  h += '<section class="kpis version-metrics">' + kpi('Required',primary.required,'Scenario positions','grid','') + kpi('Allocated',primary.allocated,'Selected draft plan','check','g') + kpi('Vacant',primary.vacant,'Unfilled positions','warn','a') + kpi('Coverage',pct1(primary.coverage),'Selected draft plan','check','g') + kpi('Priority coverage',pct1(primary.priorityCoverage),'Weighted by priority','grid','') + kpi('Eligible unassigned',primary.eligibleUnassigned,'Could fill at least one role','users','') + '</section>';
+  if(v.status!=='approved') h += '<div class="row" style="margin:0 0 18px"><button class="btn solid" data-approve-version="'+esc(v.id)+'">Approve this version</button><button class="btn ghost" data-regenerate-version="'+esc(v.id)+'">Regenerate…</button><span class="note">Drafts are private to this browser until approved.</span></div>';
+  h += '<div class="card"><header><h2>Department assignments</h2><span class="pill">'+(greedy?'Greedy draft':'Optimal draft')+'</span></header><div class="tbl-wrap"><table><thead><tr><th>Department</th><th>Required</th><th>Assigned</th><th>Vacant</th><th>Volunteers in this plan</th></tr></thead><tbody>';
+  ds.forEach(function(d){var req=reqOf(d,ev),ids=plan[d.id]||[],vac=Math.max(0,req-ids.length);h+='<tr><td><b>'+esc(d.name)+'</b><small>'+esc(d.priority)+' · '+d.start+'-'+d.end+'</small></td><td>'+req+'</td><td>'+ids.length+'</td><td class="'+(vac?'bad':'ok')+'">'+vac+'</td><td>'+versionAssignments(v,plan,d.id)+'</td></tr>';});
+  return h+'</tbody></table></div><p class="note" style="margin-top:12px">Approval is recorded in this browser. Volunteer schedules are not currently published or synced across devices.</p></div>';
+}
+function renderVersionList(eventId) {
+  var versions=(S.versions||[]).filter(function(v){return !eventId||v.eventId===eventId;}),h='<div class="card"><header><h2>Versions</h2></header>';
+  if(!versions.length)return h+'<div class="empty">No versions yet. Run both allocation methods to create a private draft.</div></div>';
+  h+='<div class="tbl-wrap"><table><thead><tr><th>#</th><th>Status</th><th>Source</th><th>Created</th><th></th></tr></thead><tbody>';
+  versions.forEach(function(v){h+='<tr><td><b>'+esc(v.id)+'</b></td><td><span class="pill '+(v.status==='approved'?'ok':'warn')+'">'+(v.status==='approved'?'approved':'draft')+'</span></td><td>'+esc(v.source)+'</td><td>'+new Date(v.createdAt).toLocaleString()+(v.scenario?'<small>What-if: '+v.scenario.dropout+'% dropout</small>':'<small>Generated by '+esc(v.source==='greedy'?'Greedy baseline':'Optimal (global)')+'</small>')+'</td><td><button class="btn sm" data-open-version="'+esc(v.id)+'">Open</button></td></tr>';});
+  return h+'</tbody></table></div></div>';
+}
+function renderAllocation() {
+  var ev=evById(ui.greedyEvent)||S.events[0];
+  if(!ev)return head('Allocation','Compare Greedy and Optimal staffing plans')+'<div class="card">'+empty('Add an event in Events & Staffing to create an allocation draft.')+'</div>';
+  ui.greedyEvent=ev.id;
+  var open=(S.versions||[]).filter(function(v){return v.id===ui.openVersionId&&v.eventId===ev.id;})[0]||(S.versions||[]).filter(function(v){return v.eventId===ev.id;})[0];
+  var c=compute(ev),gm=planStats(c.heur,ev,c,S.volunteers,c.th),om=planStats(c.opt,ev,c,S.volunteers,c.to),h=head('Allocation','Compare plans, review saved drafts, and approve a version.');
+  h+='<div class="card"><header><div><h2>Allocation</h2></div><div class="row"><label class="f">Event<select id="greedyEvent">'+S.events.map(function(x){return '<option value="'+esc(x.id)+'"'+(x.id===ev.id?' selected':'')+'>'+esc(x.name)+'</option>';}).join('')+'</select></label><label class="f">Draft from<select id="draftSource"><option value="optimal">Draft from Optimal</option><option value="greedy">Draft from Greedy</option></select></label><button class="btn solid" data-run-allocation="'+esc(ev.id)+'">Run Greedy + Optimal</button></div></header><p class="note">Creates a private draft. Volunteer accounts cannot see drafts. Both plans use the same roster and eligibility rules.</p><div class="grid2">'+metricCard('Greedy baseline',gm,open&&open.source==='greedy')+metricCard('Optimal (global)',om,open&&open.source!=='greedy')+'</div></div>'+renderVersionList(ev.id);
+  if(open)h+=versionDetail(open);return h;
+}
+function makeScenario(cfg) {
+  var ev=evById(cfg.eventId)||S.events[0];if(!ev)return null;
+  var dropout=Math.max(0,Math.min(100,+cfg.dropout||0)),multiplier=Math.max(.1,Math.min(5,+cfg.headcount||1)),extra=Math.max(0,Math.min(24,+cfg.extraHours||0)),add=Math.max(0,Math.min(200,Math.floor(+cfg.addedVolunteers||0))),pool=clone(S.volunteers),removed=Math.min(pool.length,Math.round(pool.length*dropout/100));
+  for(var i=pool.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),tmp=pool[i];pool[i]=pool[j];pool[j]=tmp;}
+  pool=pool.slice(removed).map(function(v){v.maxHours=(+v.maxHours||0)+extra;return v;});
+  var skill=cfg.skill||'',stamp=Date.now();for(var k=0;k<add;k++)pool.push({id:'SIM-'+stamp+'-'+(k+1),name:'Simulated Volunteer '+String(k+1).padStart(3,'0'),phone:'',skills:skill?[skill]:[],start:'00:00',end:'23:59',maxHours:24,exp:0,pref:'',role:'Volunteer'});
+  var trial=clone(ev);trial.name=ev.name+' (What-if)';trial.depts=trial.depts.map(function(d){d.required=Math.ceil(reqOf(d,ev)*multiplier);d.type='fixed';return d;});
+  return {event:trial,volunteers:pool,detail:{dropout:dropout,dropoutCount:removed,headcount:multiplier,extraHours:extra,addedVolunteers:add,skill:skill}};
+}
+function runScenario(cfg){var b=makeScenario(cfg);if(!b)return null;var v=saveDraftVersion(b.event,b.volunteers,'what-if',b.detail);ui.openVersionId=v.id;return v;}
+function renderWhatIf() {
+  var ev=evById(ui.simEvent)||S.events[0];if(!ev)return head('What-if Simulator','Simulate roster changes without editing saved data')+'<div class="card">'+empty('Add an event in Events & Staffing to run a what-if scenario.')+'</div>';
+  ui.simEvent=ev.id;var skills=S.skills.map(function(s){return s.name;}),skill=ui.simSkill||skills[0]||'',h=head('What-if Simulator','Simulation drafts are private planning versions and are not published to volunteers.');
+  h+='<div class="card sim-controls"><header><div><h2>Scenario inputs <span class="pill warn">Simulation - not published</span></h2><p>Test changes to the current event. Your live roster and event settings stay unchanged.</p></div><label class="f">Event<select id="simEvent">'+S.events.map(function(x){return '<option value="'+esc(x.id)+'"'+(x.id===ev.id?' selected':'')+'>'+esc(x.name)+'</option>';}).join('')+'</select></label></header><div class="sim-inputs">'+
+    '<label>Volunteer dropout % <input type="number" id="simDropout" min="0" max="100" value="'+esc(ui.simDropout===undefined?20:ui.simDropout)+'"></label><label>Headcount × <input type="number" id="simHeadcount" min="0.1" max="5" step="0.1" value="'+esc(ui.simHeadcount===undefined?1.2:ui.simHeadcount)+'"></label><label>Extra duty hours <input type="number" id="simExtraHours" min="0" max="24" value="'+esc(ui.simExtraHours===undefined?0:ui.simExtraHours)+'"></label><label>Add simulated volunteers <input type="number" id="simAddVolunteers" min="0" max="200" value="'+esc(ui.simAddVolunteers===undefined?0:ui.simAddVolunteers)+'"></label><label>With skill <select id="simSkill">'+skills.map(function(s){return '<option'+(s===skill?' selected':'')+'>'+esc(s)+'</option>';}).join('')+'</select></label><button class="btn solid" data-run-scenario="1">Run scenario</button></div></div>'+
+    '<div class="card"><header><h2>How this scenario is applied</h2></header><p class="note">Dropout removes a random sample from the roster for this run. Headcount multiplies each department’s requirement. Extra duty hours extend remaining volunteers’ maximum hours. Added volunteers are synthetic, available all day, and receive the selected skill. Every run computes Greedy and Optimal plans and saves a draft version in this browser.</p></div>';
+  var latest=(S.versions||[]).filter(function(v){return v.scenario&&v.eventId===ev.id;})[0];if(latest)h+='<div class="card"><header><div><h2>Latest scenario · '+esc(latest.id)+'</h2><p>Saved as an unpublished draft.</p></div><button class="btn" data-open-version="'+esc(latest.id)+'">Review in Allocation</button></header><div class="grid2">'+metricCard('Greedy baseline',latest.greedyMetrics,false)+metricCard('Optimal (global)',latest.optimalMetrics,false)+'</div></div>';return h;
+}
+
 function page() { return (location.hash.replace("#", "") || "dashboard"); }
 function render() {
   var role = sessionStorage.getItem("tapmi_role") || "convenor";
-  var allowed = role === "volunteer" ? ["my"] : role === "co-convenor" ? ["dashboard", "events", "roster", "skills", "audit"] : PAGES.map(function (x) { return x[0]; });
+  var allowed = role === "volunteer" ? ["my"] : role === "co-convenor" ? ["dashboard", "events", "roster", "greedy", "simulator", "committee", "skills", "audit"] : PAGES.map(function (x) { return x[0]; });
   var p = page(); if (allowed.indexOf(p) < 0) p = allowed[0];
   var navItems = PAGES.filter(function (x) { return allowed.indexOf(x[0]) >= 0; });
   if (role === "volunteer") navItems = [["my", "My Portal", "users"]];
   $("#nav").innerHTML = navItems.map(function (x) { return '<a href="#' + x[0] + '" class="' + (x[0] === p ? "on" : "") + '"' + (x[0] === p ? ' aria-current="page"' : "") + ">" + svg(x[2]) + x[1] + "</a>"; }).join("") + '<div class="role-label">' + esc(role.replace(/-/g, " ")) + '</div><button class="nav-logout" id="logout">Sign out</button>';
-  var v = p === "my" ? function () { return head("Volunteer Portal", "Your event information will appear here") + '<div class="card"><h2>Welcome to the volunteer portal</h2><p class="note" style="margin-top:10px">This demo portal is ready for volunteer specific schedules and contact details to be added.</p></div>'; } : { dashboard: renderDashboard, events: renderEvents, roster: renderRoster, committee: renderCommittee, skills: renderSkills, audit: renderAudit }[p];
+  var v = p === "my" ? function () { return head("Volunteer Portal", "Your event information will appear here") + '<div class="card"><h2>Welcome to the volunteer portal</h2><p class="note" style="margin-top:10px">This demo portal is ready for volunteer specific schedules and contact details to be added.</p></div>'; } : { dashboard: renderDashboard, events: renderEvents, roster: renderRoster, greedy: renderAllocation, simulator: renderWhatIf, committee: renderCommittee, skills: renderSkills, audit: renderAudit }[p];
   var y = window.scrollY; $("#view").innerHTML = v(); window.scrollTo(0, y);
 }
 function showAuth(message) {
@@ -396,7 +545,6 @@ function startApp(role) {
   var auth = $("#auth"), app = $(".app");
   auth.hidden = true; app.hidden = false;
   if (role === "volunteer") location.hash = "my";
-  else if (role === "co-convenor" && ["committee"].indexOf(page()) >= 0) location.hash = "dashboard";
   render();
 }
 window.addEventListener("hashchange", function () { render(); window.scrollTo(0, 0); });
@@ -426,13 +574,19 @@ function importCSV(text) {
   log("CSV import", add + " added, " + update + " updated, " + skip + " skipped (missing name)"); commit(); toast(add + " added, " + update + " updated");
 }
 document.addEventListener("click", function (e) {
-  var t = e.target.closest("[data-go],[data-dept],[data-sel],[data-delev],[data-method],[data-vedit],[data-vdel],[data-cmdel],[data-skas],[data-skdel],[data-close],#evAdd,#vAdd,#csvOut,#cmAdd,#skAdd,#reset"); if (!t) return;
+  var t = e.target.closest("[data-go],[data-dept],[data-sel],[data-delev],[data-method],[data-vedit],[data-vdel],[data-cmdel],[data-skas],[data-skdel],[data-close],[data-apply-greedy],[data-run-allocation],[data-run-scenario],[data-open-version],[data-approve-version],[data-regenerate-version],#evAdd,#vAdd,#csvOut,#cmAdd,#skAdd,#reset"); if (!t) return;
   var d = t.dataset;
   if (d.go) { var p = d.go.split(":"); ui.evSel = p[1]; location.hash = p[0]; render(); window.scrollTo(0, 0); }
   else if (d.dept) { ui.open[d.dept] = !ui.open[d.dept]; render(); }
   else if (d.sel) { ui.evSel = d.sel; render(); setTimeout(function () { var x = document.querySelectorAll("#view .card"); x[x.length - 1].scrollIntoView({ behavior: "smooth" }); }, 30); }
   else if (d.delev) { if (confirm("Delete this event?")) { var ev = evById(d.delev); S.events = S.events.filter(function (x) { return x.id !== d.delev; }); log("Event deleted", ev.name); if (ui.evSel === d.delev) ui.evSel = null; if (ui.dashEvent === d.delev) ui.dashEvent = null; commit(); } }
   else if (d.method) { var ev2 = evById(ui.evSel); ev2.method = d.method; log("Allocation method", ev2.name + " set to " + d.method); commit(); }
+  else if (d.applyGreedy) { var ge = evById(d.applyGreedy); if (ge) { ge.method = "heuristic"; log("Allocation method", ge.name + " set to greedy"); commit(); toast("Greedy plan selected for " + ge.name); } }
+  else if (d.runAllocation) { var ae=evById(d.runAllocation), source=$("#draftSource").value||"optimal"; if(ae){ui.greedyEvent=ae.id;saveDraftVersion(ae,S.volunteers,source,null);commit();} }
+  else if (d.runScenario !== undefined) { var cfg={eventId:$("#simEvent").value,dropout:$("#simDropout").value,headcount:$("#simHeadcount").value,extraHours:$("#simExtraHours").value,addedVolunteers:$("#simAddVolunteers").value,skill:$("#simSkill").value};ui.simDropout=cfg.dropout;ui.simHeadcount=cfg.headcount;ui.simExtraHours=cfg.extraHours;ui.simAddVolunteers=cfg.addedVolunteers;ui.simSkill=cfg.skill;runScenario(cfg);commit();toast("Scenario saved as a private draft"); }
+  else if (d.openVersion) { var ov=(S.versions||[]).filter(function(v){return v.id===d.openVersion;})[0];if(ov){ui.openVersionId=ov.id;ui.greedyEvent=ov.eventId;location.hash="greedy";render();} }
+  else if (d.approveVersion) { var av=(S.versions||[]).filter(function(v){return v.id===d.approveVersion;})[0];if(av){av.status="approved";av.approvedAt=Date.now();log("Allocation approved",av.id+" for "+av.eventName);commit();toast("Version approved in this browser");} }
+  else if (d.regenerateVersion) { var rv=(S.versions||[]).filter(function(v){return v.id===d.regenerateVersion;})[0];if(rv){if(rv.scenario){runScenario({eventId:rv.eventId,dropout:rv.scenario.dropout,headcount:rv.scenario.headcount,extraHours:rv.scenario.extraHours,addedVolunteers:rv.scenario.addedVolunteers,skill:rv.scenario.skill});}else{var re=evById(rv.eventId);if(re)saveDraftVersion(re,S.volunteers,rv.source,null);}commit();} }
   else if (d.close !== undefined) dlg.close();
   else if (d.vedit) { openDlg(volDialog(d.vedit)); dlg.dataset.id = d.vedit; }
   else if (d.vdel) { var v = byName(d.vdel); if (confirm("Delete " + v.name + "?")) { S.volunteers = S.volunteers.filter(function (x) { return x.id !== d.vdel; }); log("Volunteer deleted", v.id + " " + v.name); commit(); } }
@@ -468,6 +622,15 @@ document.addEventListener("keydown", function (e) { if ((e.key === "Enter" || e.
 document.addEventListener("change", function (e) {
   var t = e.target, d = t.dataset;
   if (t.id === "dashSel") { ui.dashEvent = t.value; render(); }
+  else if (t.id === "greedyEvent") { ui.greedyEvent = t.value; render(); }
+  else if (t.id === "simEvent") { var se = evById(t.value); ui.simEvent = t.value; ui.simAttendees = se ? se.attendees : 0; ui.simMethod = se && se.method || "optimal"; ui.simDepts = {}; render(); }
+  else if (t.id === "simAttendees") { ui.simAttendees = Math.max(0, +t.value || 0); render(); }
+  else if (t.id === "simMethod") { ui.simMethod = t.value; render(); }
+  else if (d.simDept && d.simField) {
+    if (!ui.simDepts[d.simDept]) ui.simDepts[d.simDept] = {};
+    ui.simDepts[d.simDept][d.simField] = d.simField === "priority" ? t.value : Math.max(0, parseFloat(t.value) || 0);
+    render();
+  }
   else if (t.id === "rsk") { ui.skillF = t.value; render(); }
   else if (t.id === "csvIn" && t.files[0]) { var fr = new FileReader(); fr.onload = function () { importCSV(fr.result); }; fr.readAsText(t.files[0]); }
   else if (d.st) { var ev = evById(d.st); ev.status = t.value; log("Event status", ev.name + " -> " + t.value); commit(); }
